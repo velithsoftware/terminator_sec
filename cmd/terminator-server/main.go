@@ -93,7 +93,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", server.handleStatus)
 	mux.HandleFunc("/api/events", server.handleEvents)
+	mux.HandleFunc("/api/events/ingest", server.handleIngest)
 	mux.HandleFunc("/api/fleet", server.handleFleet)
+	mux.HandleFunc("/api/fleet/heartbeat", server.handleHeartbeat)
 	mux.HandleFunc("/api/analytics", server.handleAnalytics)
 	mux.HandleFunc("/api/policies/decision", server.handleDecision)
 	mux.HandleFunc("/api/threats/simulate", server.handleSimulate)
@@ -198,12 +200,103 @@ func (s *CentralServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(events)
 }
 
+// handleIngest accepts a batch of ThreatEvents from a remote agent.
+func (s *CentralServer) handleIngest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var events []engine.ThreatEvent
+	if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	for _, evt := range events {
+		s.logger.LogEvent(evt)
+		// Broadcast each ingested event to connected dashboard clients
+		s.broadcastWS(map[string]interface{}{
+			"type":  "THREAT_EVENT",
+			"event": evt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "ok",
+		"ingested": len(events),
+	})
+}
+
+// handleHeartbeat accepts a live status heartbeat from a remote agent
+// and dynamically updates the fleet registry.
+func (s *CentralServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var hb struct {
+		AgentID        string    `json:"agent_id"`
+		Hostname       string    `json:"hostname"`
+		OS             string    `json:"os"`
+		Version        string    `json:"agent_version"`
+		CPUUsagePct    float64   `json:"cpu_usage_pct"`
+		TotalQueries   uint64    `json:"total_queries"`
+		ThreatsBlocked uint64    `json:"threats_blocked"`
+		Timestamp      time.Time `json:"timestamp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	status := "Protected"
+	if hb.ThreatsBlocked > 50 {
+		status = "Warning"
+	}
+
+	s.mu.Lock()
+	updated := false
+	for i, d := range s.fleet {
+		if d.ID == hb.AgentID || d.Hostname == hb.Hostname {
+			s.fleet[i].LastSeen = time.Now()
+			s.fleet[i].CPUUsage = hb.CPUUsagePct
+			s.fleet[i].Status = status
+			s.fleet[i].Version = hb.Version
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		// Register new agent dynamically
+		s.fleet = append(s.fleet, DeviceInfo{
+			ID:       hb.AgentID,
+			Hostname: hb.Hostname,
+			OS:       hb.OS,
+			Version:  hb.Version,
+			IP:       r.RemoteAddr,
+			Status:   status,
+			LastSeen: time.Now(),
+			CPUUsage: hb.CPUUsagePct,
+		})
+	}
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func (s *CentralServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.fleet)
 }
+
 
 func (s *CentralServer) handleAnalytics(w http.ResponseWriter, r *http.Request) {
 	events := s.logger.GetEvents(500)
