@@ -5,6 +5,11 @@
 #   Feature  : users/abhinav/<feature_name>     → CI only (build + test)
 #   Release  : release/abhinav/<feature_name>   → CI + Deploy to trsec_sit
 #   Protected: main, trsec_sit                  → No direct push; PR only
+#
+# SIT Environment:
+#   Name     : trsec-sit
+#   Resource : Windows VM (self-hosted Azure Pipelines agent)
+#   Approval : Manual gate required before deployment
 # =============================================================================
 
 trigger:
@@ -172,11 +177,250 @@ stages:
               publishLocation: "pipeline"
 
   # ===========================================================================
-  # STAGE 2 — Merge to trsec_sit  (release/abhinav/* branches ONLY)
+  # STAGE 2 — Deploy to SIT VM  (release/abhinav/* branches ONLY)
+  # Targets the 'trsec-sit' Azure DevOps Environment (Windows VM resource)
+  # Manual approval gate configured on the environment in ADO.
   # ===========================================================================
-  - stage: Merge_To_SIT
-    displayName: "CD — Merge to trsec_sit"
+  - stage: Deploy_SIT
+    displayName: "CD — Deploy to trsec-sit (Windows VM)"
     dependsOn: CI
+    condition: |
+      and(
+        succeeded(),
+        startsWith(variables['Build.SourceBranch'], 'refs/heads/release/abhinav/')
+      )
+    jobs:
+
+      # deployment job — runs ON the registered Windows VM agent
+      - deployment: Deploy_To_SIT_VM
+        displayName: "Deploy Binaries to trsec-sit VM"
+        environment:
+          name: trsec-sit          # must match the Environment name in ADO
+          resourceType: VirtualMachine
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                # ── 1. Download Windows build artifact from CI stage ──────────
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Windows Binaries"
+                  inputs:
+                    artifact: "go-binaries-$(Build.BuildId)"
+                    path: "$(Pipeline.Workspace)\\bin"
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Dashboard Dist"
+                  inputs:
+                    artifact: "dashboard-dist-$(Build.BuildId)"
+                    path: "$(Pipeline.Workspace)\\dashboard-dist"
+
+                # ── 2. Stop any existing running Terminator services ──────────
+                - task: PowerShell@2
+                  displayName: "Stop Existing Terminator Processes"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      Write-Host "==> Stopping any running Terminator Sec processes..."
+                      Stop-Process -Name terminator-agent  -Force -ErrorAction SilentlyContinue
+                      Stop-Process -Name terminator-server -Force -ErrorAction SilentlyContinue
+                      Write-Host "==> Processes stopped (or were not running)."
+
+                # ── 3. Copy binaries to SIT deploy directory ──────────────────
+                - task: PowerShell@2
+                  displayName: "Deploy Binaries to C:\\TerminatorSIT"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      $deployDir = "C:\TerminatorSIT"
+                      $binSrc   = "$(Pipeline.Workspace)\bin\windows"
+                      $dashSrc  = "$(Pipeline.Workspace)\dashboard-dist"
+
+                      Write-Host "==> Creating deploy directory: $deployDir"
+                      New-Item -ItemType Directory -Force -Path $deployDir | Out-Null
+                      New-Item -ItemType Directory -Force -Path "$deployDir\dashboard" | Out-Null
+
+                      Write-Host "==> Copying Windows binaries..."
+                      Copy-Item "$binSrc\terminator-agent.exe"  -Destination "$deployDir\" -Force
+                      Copy-Item "$binSrc\terminator-cli.exe"    -Destination "$deployDir\" -Force
+                      Copy-Item "$binSrc\terminator-server.exe" -Destination "$deployDir\" -Force
+
+                      Write-Host "==> Copying Dashboard dist..."
+                      Copy-Item "$dashSrc\*" -Destination "$deployDir\dashboard\" -Recurse -Force
+
+                      Write-Host "==> Build: $(Build.BuildId) | Branch: $(Build.SourceBranchName)"
+                      Set-Content "$deployDir\BUILD_INFO.txt" "Build: $(Build.BuildId)`nBranch: $(Build.SourceBranchName)`nCommit: $(Build.SourceVersion)`nDeployed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+
+                      Write-Host "==> Deploy complete. Contents:"
+                      Get-ChildItem $deployDir
+
+                # ── 4. Start terminator-server on SIT ─────────────────────────
+                - task: PowerShell@2
+                  displayName: "Start terminator-server on SIT (port 8080)"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      $deployDir = "C:\TerminatorSIT"
+                      Write-Host "==> Starting terminator-server..."
+                      Start-Process `
+                        -FilePath "$deployDir\terminator-server.exe" `
+                        -ArgumentList "-port 8080" `
+                        -WindowStyle Hidden `
+                        -PassThru
+                      Start-Sleep -Seconds 3
+                      Write-Host "==> Server started. Verifying port 8080..."
+                      $conn = Test-NetConnection -ComputerName localhost -Port 8080
+                      if (-not $conn.TcpTestSucceeded) {
+                        Write-Error "terminator-server did not bind to port 8080!"
+                        exit 1
+                      }
+                      Write-Host "==> terminator-server is UP on port 8080."
+
+            # ── on: routeTrafficStrategy (runs after deploy) ─────────────────
+            on:
+              failure:
+                steps:
+                  - task: PowerShell@2
+                    displayName: "Rollback — Stop Failed Deployment"
+                    inputs:
+                      targetType: inline
+                      script: |
+                        Write-Host "==> Deployment failed. Stopping processes..."
+                        Stop-Process -Name terminator-server -Force -ErrorAction SilentlyContinue
+                        Stop-Process -Name terminator-agent  -Force -ErrorAction SilentlyContinue
+                        Write-Host "==> Rollback complete."
+
+  # ===========================================================================
+  # STAGE 3 — SIT Smoke Tests  (runs on SIT VM after deployment)
+  # ===========================================================================
+  - stage: SIT_Smoke_Tests
+    displayName: "SIT — Smoke Tests & Validation"
+    dependsOn: Deploy_SIT
+    condition: |
+      and(
+        succeeded(),
+        startsWith(variables['Build.SourceBranch'], 'refs/heads/release/abhinav/')
+      )
+    jobs:
+
+      - deployment: SIT_Tests
+        displayName: "Run Smoke Tests on trsec-sit VM"
+        environment:
+          name: trsec-sit
+          resourceType: VirtualMachine
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                # ── Test 1: API Health Check ──────────────────────────────────
+                - task: PowerShell@2
+                  displayName: "Smoke Test 1 — /api/status health check"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      Write-Host "==> Checking /api/status..."
+                      $resp = Invoke-RestMethod -Uri "http://localhost:8080/api/status" -Method GET
+                      Write-Host "Agent Version : $($resp.agent_version)"
+                      Write-Host "Platform      : $($resp.platform)"
+                      Write-Host "DNS Proxy     : $($resp.dns_proxy_active)"
+                      if (-not $resp.agent_version) {
+                        Write-Error "Health check failed: no agent_version returned"
+                        exit 1
+                      }
+                      Write-Host "==> PASS: /api/status healthy."
+
+                # ── Test 2: CLI Domain Analysis (allowlist) ───────────────────
+                - task: PowerShell@2
+                  displayName: "Smoke Test 2 — CLI: google.com should ALLOW"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      $cli = "C:\TerminatorSIT\terminator-cli.exe"
+                      Write-Host "==> Testing whitelisted domain: google.com"
+                      $out = & $cli test-domain google.com 2>&1
+                      Write-Host $out
+                      if ($out -notmatch "ALLOW") {
+                        Write-Error "FAIL: google.com should be ALLOW"
+                        exit 1
+                      }
+                      Write-Host "==> PASS: google.com → ALLOW"
+
+                # ── Test 3: CLI Domain Analysis (C2 block) ────────────────────
+                - task: PowerShell@2
+                  displayName: "Smoke Test 3 — CLI: emotet-c2.net should AUTO_BLOCK"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      $cli = "C:\TerminatorSIT\terminator-cli.exe"
+                      Write-Host "==> Testing known C2 domain: emotet-c2.net"
+                      $out = & $cli test-domain emotet-c2.net 2>&1
+                      Write-Host $out
+                      if ($out -notmatch "AUTO_BLOCK") {
+                        Write-Error "FAIL: emotet-c2.net should be AUTO_BLOCK"
+                        exit 1
+                      }
+                      Write-Host "==> PASS: emotet-c2.net → AUTO_BLOCK"
+
+                # ── Test 4: Threat Simulator API ──────────────────────────────
+                - task: PowerShell@2
+                  displayName: "Smoke Test 4 — Threat Simulator API"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      Write-Host "==> Simulating DGA threat via API..."
+                      $body = '{"target":"xk9qz7w4lm2p0a.xyz","threat_type":"dga"}'
+                      $resp = Invoke-RestMethod `
+                        -Uri "http://localhost:8080/api/threats/simulate" `
+                        -Method POST `
+                        -ContentType "application/json" `
+                        -Body $body
+                      Write-Host "Verdict   : $($resp.verdict.action)"
+                      Write-Host "Severity  : $($resp.verdict.severity)"
+                      Write-Host "Latency   : $($resp.latency_ms) ms"
+                      if ($resp.verdict.severity -lt 4) {
+                        Write-Error "FAIL: DGA domain severity too low ($($resp.verdict.severity))"
+                        exit 1
+                      }
+                      if ($resp.latency_ms -gt 10) {
+                        Write-Error "FAIL: Latency exceeded 10ms budget ($($resp.latency_ms) ms)"
+                        exit 1
+                      }
+                      Write-Host "==> PASS: Threat simulator responded correctly within latency budget."
+
+                # ── Test 5: Fleet API ─────────────────────────────────────────
+                - task: PowerShell@2
+                  displayName: "Smoke Test 5 — /api/fleet returns device list"
+                  inputs:
+                    targetType: inline
+                    script: |
+                      Write-Host "==> Checking /api/fleet..."
+                      $fleet = Invoke-RestMethod -Uri "http://localhost:8080/api/fleet" -Method GET
+                      Write-Host "Fleet devices: $($fleet.Count)"
+                      if ($fleet.Count -lt 1) {
+                        Write-Error "FAIL: Fleet returned no devices"
+                        exit 1
+                      }
+                      Write-Host "==> PASS: Fleet returned $($fleet.Count) device(s)."
+
+                # ── Publish Test Summary ──────────────────────────────────────
+                - task: PowerShell@2
+                  displayName: "Publish SIT Test Summary"
+                  condition: always()
+                  inputs:
+                    targetType: inline
+                    script: |
+                      Write-Host "##[section]SIT Smoke Test Summary — Build $(Build.BuildId)"
+                      Write-Host "Branch  : $(Build.SourceBranchName)"
+                      Write-Host "Commit  : $(Build.SourceVersion)"
+                      Write-Host "Tests   : /api/status | CLI ALLOW | CLI AUTO_BLOCK | Simulator | Fleet"
+
+  # ===========================================================================
+  # STAGE 4 — Auto PR: release/abhinav/* → trsec_sit (after SIT passes)
+  # ===========================================================================
+  - stage: Merge_To_SIT_Branch
+    displayName: "CD — Create PR to trsec_sit branch"
+    dependsOn: SIT_Smoke_Tests
     condition: |
       and(
         succeeded(),
@@ -195,13 +439,8 @@ stages:
             fetchDepth: 0
 
           - script: |
-              git config user.email "pipeline@terminator-sec.io"
-              git config user.name  "Terminator CI"
-            displayName: "Configure Git Identity"
-
-          - script: |
-              BRANCH=$(Build.SourceBranchName)
-              echo "Source release branch: $BRANCH"
+              BRANCH="$(Build.SourceBranchName)"
+              echo "Release branch: $BRANCH"
               echo "##vso[task.setvariable variable=RELEASE_BRANCH]$BRANCH"
             displayName: "Extract Release Branch Name"
 
@@ -222,51 +461,29 @@ stages:
                 COMMIT="$(Build.SourceVersion)"
                 SHORT_COMMIT="${COMMIT:0:7}"
 
-                TITLE="[Release] $(RELEASE_BRANCH) → trsec_sit [Build #${BUILD_ID}]"
-                BODY=$(cat <<EOF
-                ## Automated Release PR
-
-                | Field       | Value                                  |
-                |-------------|----------------------------------------|
-                | Source      | \`$(RELEASE_BRANCH)\`                  |
-                | Target      | \`trsec_sit\`                          |
-                | Build       | #${BUILD_ID}                           |
-                | Commit      | \`${SHORT_COMMIT}\`                    |
-                | Pipeline    | $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=${BUILD_ID} |
-
-                ### Checklist
-                - [x] CI passed (Go Build + Tests + Dashboard Build)
-                - [ ] Reviewer sign-off
-                - [ ] SIT smoke test passed
-                EOF
-                )
+                TITLE="[SIT Verified] $(RELEASE_BRANCH) → trsec_sit [Build #${BUILD_ID}]"
+                BODY=$(printf '## SIT-Verified Release PR\n\n| Field | Value |\n|---|---|\n| Source | `'"$(RELEASE_BRANCH)"'` |\n| Target | `trsec_sit` |\n| Build | #'"${BUILD_ID}"' |\n| Commit | `'"${SHORT_COMMIT}"'` |\n\n### SIT Smoke Tests Passed\n- [x] /api/status health check\n- [x] CLI ALLOW (google.com)\n- [x] CLI AUTO_BLOCK (emotet-c2.net)\n- [x] Threat Simulator latency < 10ms\n- [x] Fleet API response\n\n### Merge Checklist\n- [ ] Reviewer sign-off\n- [ ] QA approval')
 
                 PAYLOAD=$(jq -n \
                   --arg title "$TITLE" \
-                  --arg src "$SOURCE_BRANCH" \
-                  --arg tgt "$TARGET_BRANCH" \
-                  --arg desc "$BODY" \
-                  '{
-                    title: $title,
-                    sourceRefName: $src,
-                    targetRefName: $tgt,
-                    description: $desc,
-                    isDraft: false
-                  }')
+                  --arg src   "$SOURCE_BRANCH" \
+                  --arg tgt   "$TARGET_BRANCH" \
+                  --arg desc  "$BODY" \
+                  '{title:$title,sourceRefName:$src,targetRefName:$tgt,description:$desc,isDraft:false}')
 
                 curl -sf -X POST \
                   -H "Content-Type: application/json" \
-                  -H "Authorization: Basic $(echo -n ":${AZURE_DEVOPS_TOKEN}" | base64)" \
+                  -H "Authorization: Basic $(printf ':%s' "${AZURE_DEVOPS_TOKEN}" | base64 -w0)" \
                   -d "$PAYLOAD" \
                   "https://dev.azure.com/${ORG}/${PROJECT}/_apis/git/repositories/${REPO}/pullrequests?api-version=7.1" \
-                || echo "PR may already exist or was created manually — skipping."
+                || echo "PR may already exist — skipping."
 
   # ===========================================================================
-  # STAGE 3 — Package & Release Artifacts (release/abhinav/* branches ONLY)
+  # STAGE 5 — Package & Release Artifacts
   # ===========================================================================
   - stage: Package
     displayName: "Package — Distribution Archives"
-    dependsOn: Merge_To_SIT
+    dependsOn: Merge_To_SIT_Branch
     condition: |
       and(
         succeeded(),
@@ -297,22 +514,19 @@ stages:
               STAGING="$(Build.ArtifactStagingDirectory)/packages"
               mkdir -p "$STAGING"
 
-              # macOS package
               cp -r $(Pipeline.Workspace)/bin/darwin-arm64 /tmp/trsec-macos
               cp -r $(Pipeline.Workspace)/dashboard-dist   /tmp/trsec-macos/dashboard
               cd /tmp && zip -r "$STAGING/terminator-sec-macos-arm64-$(Build.BuildId).zip" trsec-macos/
 
-              # Windows package
               cp -r $(Pipeline.Workspace)/bin/windows /tmp/trsec-windows
               cp -r $(Pipeline.Workspace)/dashboard-dist /tmp/trsec-windows/dashboard
               cd /tmp && zip -r "$STAGING/terminator-sec-windows-amd64-$(Build.BuildId).zip" trsec-windows/
 
-              # Linux package
               cp -r $(Pipeline.Workspace)/bin/linux /tmp/trsec-linux
               cp -r $(Pipeline.Workspace)/dashboard-dist /tmp/trsec-linux/dashboard
               cd /tmp && zip -r "$STAGING/terminator-sec-linux-amd64-$(Build.BuildId).zip" trsec-linux/
 
-              echo "==> Packages created:"
+              echo "==> Packages:"
               ls -lh "$STAGING/"
             displayName: "Create Distribution Packages"
 
