@@ -69,13 +69,6 @@ stages:
             inputs:
               version: "$(GO_VERSION)"
 
-          - task: Cache@2
-            displayName: "Cache Go modules"
-            inputs:
-              key: 'go-mod | "$(Agent.OS)" | go.sum'
-              restoreKeys: go-mod | "$(Agent.OS)"
-              path: "$(GOPATH)/pkg/mod"
-
           - script: go mod download
             displayName: "Download dependencies"
 
@@ -127,13 +120,6 @@ stages:
             displayName: "Install Node.js $(NODE_VERSION)"
             inputs:
               versionSpec: "$(NODE_VERSION)"
-
-          - task: Cache@2
-            displayName: "Cache node_modules"
-            inputs:
-              key: 'npm | "$(Agent.OS)" | $(DASHBOARD_DIR)/package-lock.json'
-              restoreKeys: npm | "$(Agent.OS)"
-              path: "$(DASHBOARD_DIR)/node_modules"
 
           - script: cd $(DASHBOARD_DIR) && npm ci
             displayName: "npm ci"
