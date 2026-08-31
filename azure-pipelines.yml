@@ -1,0 +1,324 @@
+# =============================================================================
+# Terminator Sec — Azure Pipelines
+# =============================================================================
+# Branch Strategy:
+#   Feature  : users/abhinav/<feature_name>     → CI only (build + test)
+#   Release  : release/abhinav/<feature_name>   → CI + Deploy to trsec_sit
+#   Protected: main, trsec_sit                  → No direct push; PR only
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - users/abhinav/*
+      - release/abhinav/*
+  paths:
+    exclude:
+      - "*.md"
+      - ".gitignore"
+      - "azure-devops-terminator-sec-tasks.csv"
+
+pr:
+  branches:
+    include:
+      - trsec_sit
+      - main
+  paths:
+    exclude:
+      - "*.md"
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+variables:
+  GO_VERSION: "1.25.0"
+  NODE_VERSION: "20.x"
+  DASHBOARD_DIR: "apps/dashboard"
+  BIN_DIR: "$(Build.ArtifactStagingDirectory)/bin"
+  IS_RELEASE_BRANCH: $[startsWith(variables['Build.SourceBranch'], 'refs/heads/release/abhinav/')]
+  FEATURE_NAME: $[replace(variables['Build.SourceBranchName'], 'abhinav/', '')]
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+stages:
+
+  # ===========================================================================
+  # STAGE 1 — CI: Build & Test (runs on ALL branches)
+  # ===========================================================================
+  - stage: CI
+    displayName: "CI — Build & Test"
+    jobs:
+
+      # -----------------------------------------------------------------------
+      # JOB 1: Go Backend — Build & Test
+      # -----------------------------------------------------------------------
+      - job: Go_Build_Test
+        displayName: "Go Backend — Build & Test"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: GoTool@0
+            displayName: "Install Go $(GO_VERSION)"
+            inputs:
+              version: "$(GO_VERSION)"
+
+          - script: |
+              echo "==> Go version"
+              go version
+              echo "==> Module: $(go list -m)"
+            displayName: "Go Environment Info"
+
+          - task: Cache@2
+            displayName: "Cache Go module dependencies"
+            inputs:
+              key: 'go-mod | "$(Agent.OS)" | go.sum'
+              restoreKeys: |
+                go-mod | "$(Agent.OS)"
+              path: "$(GOPATH)/pkg/mod"
+
+          - script: |
+              go mod download
+            displayName: "Download Go Modules"
+
+          - script: |
+              echo "==> Running Go vet..."
+              go vet ./...
+            displayName: "Go Vet — Static Analysis"
+
+          - script: |
+              echo "==> Running tests with race detector..."
+              go test -v -race -count=1 -timeout 120s ./pkg/...
+            displayName: "Go Test — Unit Tests + Race Detector"
+
+          - script: |
+              echo "==> Running benchmarks..."
+              go test -bench=. -benchtime=3s -run='^$' ./pkg/engine/...
+            displayName: "Go Benchmark — Threat Engine Latency"
+
+          - script: |
+              echo "==> Building macOS (darwin/amd64) binaries..."
+              mkdir -p $(BIN_DIR)/darwin
+              GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/darwin/terminator-agent   ./cmd/terminator-agent
+              GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/darwin/terminator-cli     ./cmd/terminator-cli
+              GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/darwin/terminator-server  ./cmd/terminator-server
+              echo "==> Building macOS (darwin/arm64) binaries..."
+              mkdir -p $(BIN_DIR)/darwin-arm64
+              GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o $(BIN_DIR)/darwin-arm64/terminator-agent   ./cmd/terminator-agent
+              GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o $(BIN_DIR)/darwin-arm64/terminator-cli     ./cmd/terminator-cli
+              GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o $(BIN_DIR)/darwin-arm64/terminator-server  ./cmd/terminator-server
+              echo "==> Building Windows (amd64) binaries..."
+              mkdir -p $(BIN_DIR)/windows
+              GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/windows/terminator-agent.exe   ./cmd/terminator-agent
+              GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/windows/terminator-cli.exe     ./cmd/terminator-cli
+              GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/windows/terminator-server.exe  ./cmd/terminator-server
+              echo "==> Building Linux (amd64) binaries..."
+              mkdir -p $(BIN_DIR)/linux
+              GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/linux/terminator-agent   ./cmd/terminator-agent
+              GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/linux/terminator-cli     ./cmd/terminator-cli
+              GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $(BIN_DIR)/linux/terminator-server  ./cmd/terminator-server
+            displayName: "Go Build — All Platforms"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Go Binaries"
+            inputs:
+              targetPath: "$(BIN_DIR)"
+              artifact: "go-binaries-$(Build.BuildId)"
+              publishLocation: "pipeline"
+
+      # -----------------------------------------------------------------------
+      # JOB 2: React Dashboard — Build
+      # -----------------------------------------------------------------------
+      - job: Dashboard_Build
+        displayName: "Dashboard — Node Build"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            displayName: "Install Node.js $(NODE_VERSION)"
+            inputs:
+              versionSpec: "$(NODE_VERSION)"
+
+          - task: Cache@2
+            displayName: "Cache node_modules"
+            inputs:
+              key: 'npm | "$(Agent.OS)" | $(DASHBOARD_DIR)/package-lock.json'
+              restoreKeys: |
+                npm | "$(Agent.OS)"
+              path: "$(DASHBOARD_DIR)/node_modules"
+
+          - script: |
+              cd $(DASHBOARD_DIR)
+              npm ci
+            displayName: "npm ci — Install Dependencies"
+
+          - script: |
+              cd $(DASHBOARD_DIR)
+              npm run build
+            displayName: "Vite Build — Production Dashboard"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Dashboard Dist"
+            inputs:
+              targetPath: "$(DASHBOARD_DIR)/dist"
+              artifact: "dashboard-dist-$(Build.BuildId)"
+              publishLocation: "pipeline"
+
+  # ===========================================================================
+  # STAGE 2 — Merge to trsec_sit  (release/abhinav/* branches ONLY)
+  # ===========================================================================
+  - stage: Merge_To_SIT
+    displayName: "CD — Merge to trsec_sit"
+    dependsOn: CI
+    condition: |
+      and(
+        succeeded(),
+        startsWith(variables['Build.SourceBranch'], 'refs/heads/release/abhinav/')
+      )
+    jobs:
+
+      - job: Create_PR_To_SIT
+        displayName: "Auto PR — release branch → trsec_sit"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+
+          - script: |
+              git config user.email "pipeline@terminator-sec.io"
+              git config user.name  "Terminator CI"
+            displayName: "Configure Git Identity"
+
+          - script: |
+              BRANCH=$(Build.SourceBranchName)
+              echo "Source release branch: $BRANCH"
+              echo "##vso[task.setvariable variable=RELEASE_BRANCH]$BRANCH"
+            displayName: "Extract Release Branch Name"
+
+          - task: Bash@3
+            displayName: "Create PR via Azure DevOps REST API"
+            env:
+              AZURE_DEVOPS_TOKEN: $(AZURE_DEVOPS_PAT)
+            inputs:
+              targetType: "inline"
+              script: |
+                set -e
+                ORG="$(AZURE_DEVOPS_ORG)"
+                PROJECT="$(AZURE_DEVOPS_PROJECT)"
+                REPO="$(Build.Repository.Name)"
+                SOURCE_BRANCH="refs/heads/$(RELEASE_BRANCH)"
+                TARGET_BRANCH="refs/heads/trsec_sit"
+                BUILD_ID="$(Build.BuildId)"
+                COMMIT="$(Build.SourceVersion)"
+                SHORT_COMMIT="${COMMIT:0:7}"
+
+                TITLE="[Release] $(RELEASE_BRANCH) → trsec_sit [Build #${BUILD_ID}]"
+                BODY=$(cat <<EOF
+                ## Automated Release PR
+
+                | Field       | Value                                  |
+                |-------------|----------------------------------------|
+                | Source      | \`$(RELEASE_BRANCH)\`                  |
+                | Target      | \`trsec_sit\`                          |
+                | Build       | #${BUILD_ID}                           |
+                | Commit      | \`${SHORT_COMMIT}\`                    |
+                | Pipeline    | $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=${BUILD_ID} |
+
+                ### Checklist
+                - [x] CI passed (Go Build + Tests + Dashboard Build)
+                - [ ] Reviewer sign-off
+                - [ ] SIT smoke test passed
+                EOF
+                )
+
+                PAYLOAD=$(jq -n \
+                  --arg title "$TITLE" \
+                  --arg src "$SOURCE_BRANCH" \
+                  --arg tgt "$TARGET_BRANCH" \
+                  --arg desc "$BODY" \
+                  '{
+                    title: $title,
+                    sourceRefName: $src,
+                    targetRefName: $tgt,
+                    description: $desc,
+                    isDraft: false
+                  }')
+
+                curl -sf -X POST \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Basic $(echo -n ":${AZURE_DEVOPS_TOKEN}" | base64)" \
+                  -d "$PAYLOAD" \
+                  "https://dev.azure.com/${ORG}/${PROJECT}/_apis/git/repositories/${REPO}/pullrequests?api-version=7.1" \
+                || echo "PR may already exist or was created manually — skipping."
+
+  # ===========================================================================
+  # STAGE 3 — Package & Release Artifacts (release/abhinav/* branches ONLY)
+  # ===========================================================================
+  - stage: Package
+    displayName: "Package — Distribution Archives"
+    dependsOn: Merge_To_SIT
+    condition: |
+      and(
+        succeeded(),
+        startsWith(variables['Build.SourceBranch'], 'refs/heads/release/abhinav/')
+      )
+    jobs:
+
+      - job: Package_Artifacts
+        displayName: "Zip & Publish Release Packages"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Go Binaries"
+            inputs:
+              artifact: "go-binaries-$(Build.BuildId)"
+              path: "$(Pipeline.Workspace)/bin"
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Dashboard Dist"
+            inputs:
+              artifact: "dashboard-dist-$(Build.BuildId)"
+              path: "$(Pipeline.Workspace)/dashboard-dist"
+
+          - script: |
+              set -e
+              STAGING="$(Build.ArtifactStagingDirectory)/packages"
+              mkdir -p "$STAGING"
+
+              # macOS package
+              cp -r $(Pipeline.Workspace)/bin/darwin-arm64 /tmp/trsec-macos
+              cp -r $(Pipeline.Workspace)/dashboard-dist   /tmp/trsec-macos/dashboard
+              cd /tmp && zip -r "$STAGING/terminator-sec-macos-arm64-$(Build.BuildId).zip" trsec-macos/
+
+              # Windows package
+              cp -r $(Pipeline.Workspace)/bin/windows /tmp/trsec-windows
+              cp -r $(Pipeline.Workspace)/dashboard-dist /tmp/trsec-windows/dashboard
+              cd /tmp && zip -r "$STAGING/terminator-sec-windows-amd64-$(Build.BuildId).zip" trsec-windows/
+
+              # Linux package
+              cp -r $(Pipeline.Workspace)/bin/linux /tmp/trsec-linux
+              cp -r $(Pipeline.Workspace)/dashboard-dist /tmp/trsec-linux/dashboard
+              cd /tmp && zip -r "$STAGING/terminator-sec-linux-amd64-$(Build.BuildId).zip" trsec-linux/
+
+              echo "==> Packages created:"
+              ls -lh "$STAGING/"
+            displayName: "Create Distribution Packages"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Release Packages"
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)/packages"
+              artifact: "release-packages-$(Build.BuildId)"
+              publishLocation: "pipeline"
