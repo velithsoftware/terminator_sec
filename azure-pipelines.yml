@@ -148,13 +148,53 @@ stages:
               artifact: "dashboard-$(Build.BuildId)"
 
   # ===========================================================================
-  # STAGE 2 — SIT: Deploy + Smoke Test
+  # STAGE 2 — Await Manual Approval before SIT deployment
+  # Pauses pipeline and notifies the approver. Pipeline resumes only after
+  # explicit approval in Azure Pipelines UI (Pipelines → Run → Review).
+  # ===========================================================================
+  - stage: Await_Approval
+    displayName: "Gate — Awaiting SIT Approval"
+    dependsOn: CI
+    condition: |
+      and(
+        succeeded(),
+        startsWith(variables['Build.SourceBranch'], 'refs/heads/release/abhinav/')
+      )
+    jobs:
+
+      - job: Approval_Gate
+        displayName: "Manual Approval Required Before SIT"
+        pool: server                          # runs on ADO server, no agent needed
+        timeoutInMinutes: 1440               # wait up to 24 hours for approval
+        steps:
+
+          - task: ManualValidation@1
+            displayName: "Approve SIT Deployment"
+            inputs:
+              notifyUsers: |
+                abhinavd011@DFORGEAI
+              instructions: |
+                ## SIT Deployment Approval Required
+
+                **Branch**: $(Build.SourceBranchName)
+                **Build**: #$(Build.BuildId)
+                **Commit**: $(Build.SourceVersion)
+
+                CI has passed. Please review and approve to proceed with:
+                - Deploying binaries to the SIT Windows agent
+                - Running 5 smoke tests against terminator-server
+                - Auto-creating PR to trsec_sit on success
+
+                **Approve** to continue or **Reject** to abort.
+              onTimeout: reject              # auto-reject if no response in 24h
+
+  # ===========================================================================
+  # STAGE 3 — SIT: Deploy + Smoke Test (after manual approval)
   # Microsoft-hosted Windows agent (free tier)
-  # Single job: server starts and tests run on the same ephemeral VM
   # ===========================================================================
   - stage: SIT
     displayName: "SIT — Deploy & Smoke Test (windows-latest)"
-    dependsOn: CI
+    dependsOn: Await_Approval
     condition: |
       and(
         succeeded(),
