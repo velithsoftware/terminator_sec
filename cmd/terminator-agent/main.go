@@ -15,6 +15,7 @@ import (
 	"github.com/terminator-sec/terminator/pkg/ipc"
 	"github.com/terminator-sec/terminator/pkg/monitor"
 	"github.com/terminator-sec/terminator/pkg/platform"
+	"github.com/terminator-sec/terminator/pkg/telemetry"
 )
 
 func main() {
@@ -23,6 +24,7 @@ func main() {
 	upstreamDNS := flag.String("upstream", "1.1.1.1:53", "Upstream DNS resolver")
 	logPath := flag.String("log-file", "", "Path to audit log JSONL file")
 	setSystemDNS := flag.Bool("set-system-dns", false, "Automatically configure OS system DNS to route through proxy")
+	serverURL := flag.String("server-url", "", "Central server URL for telemetry (e.g. http://localhost:8080). Leave empty to disable.")
 	flag.Parse()
 
 	startTime := time.Now()
@@ -128,6 +130,29 @@ func main() {
 	netMon := monitor.NewNetworkMonitor(analyzer, auditLogger, ipcServer)
 	_ = netMon
 	log.Println("[INFO] Network Port Scan & Egress Monitor active")
+
+	// 7. Start Telemetry Forwarder (if server URL provided)
+	if *serverURL != "" {
+		tClient := telemetry.NewClient(
+			*serverURL,
+			*dnsPort,
+			func() (uint64, uint64, uint64) {
+				if dnsProxy != nil {
+					return dnsProxy.GetStats()
+				}
+				return 0, 0, 0
+			},
+			func(limit int) []engine.ThreatEvent {
+				return auditLogger.GetEvents(limit)
+			},
+			nil,
+		)
+		tClient.Start()
+		defer tClient.Stop()
+		log.Printf("[INFO] Telemetry forwarder active → %s (heartbeat every 10s, events every 5s)\n", *serverURL)
+	} else {
+		log.Println("[INFO] Telemetry forwarder disabled (use -server-url to enable)")
+	}
 
 	// 7. Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
